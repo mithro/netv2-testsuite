@@ -93,6 +93,82 @@ def main():
         core.wr(HDCP_CTL, 0)
         core.wr(CP_CONFIG, core.rd(CP_CONFIG) & ~CFG_ENABLE_KU)
         snap(core, "reverted")
+    elif mode == "encrypt4":
+        ST_CORE_AUTH = 1 << 3
+        CFG_RDB_KEY_LOAD = 1 << 10
+        SCHED, ENC_ONLY_WHEN_AUTH = 0xC0, 1 << 6
+        TST_MODE_AN, TST_EXT_AN, TST_FORCE_KEY_VALID = 1 << 6, 1 << 7, 1 << 8
+        snap(core, "before")
+        core.wr(SCHED, core.rd(SCHED) | ENC_ONLY_WHEN_AUTH)
+        core.wr(TST_AN0, 0); core.wr(TST_AN1, 0)
+        core.wr(CP_TST, TST_FORCE_KEY_VALID | TST_MODE_AN | TST_EXT_AN)
+        core.wr(BKSV0, BKSV & 0xFFFFFFFF); core.wr(BKSV1, (BKSV >> 32) & 0xFF)
+        # set key base = 0
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG) & ~0x3FF)
+        # load keys via BOTH the 0x809000 loader (addr 0..39) and RDB (base 0)
+        for n in range(40):
+            keyl.wr(K_ADR, n); keyl.wr(K_KY0, KEYS[n] & 0xFFFFFFFF)
+            keyl.wr(K_KY1, (KEYS[n] >> 32) & 0xFFFFFF); keyl.wr(K_CTL, 1)
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG) | CFG_RDB_KEY_LOAD)
+        for n in range(40):
+            k = KEYS[n]
+            core.wr(HDCP_KEY_2, (k >> 24) & 0xFFFFFFFF)
+            core.wr(HDCP_KEY_1, ((k & 0xFFFFFF) << 8) | n)
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG) & ~CFG_RDB_KEY_LOAD)
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG) | CFG_ENABLE_KU)
+        snap(core, "keys(both)+forcekey+KU")
+        core.wr(HDCP_CTL, CTL_AUTH_REQ)
+        got = -1
+        for i in range(80):   # up to ~2s
+            st = core.rd(CP_STATUS)
+            if st & ST_CORE_AUTH:
+                got = i; break
+            time.sleep(0.025)
+        snap(core, "after AUTH_REQUEST (core_auth@%d)" % got)
+        ri = [core.rd(CP_INTEGRITY) for _ in range(4)]
+        for _ in range(3):
+            time.sleep(0.6); ri.append(core.rd(CP_INTEGRITY))
+        print("  CP_INTEGRITY samples:", " ".join("0x%08x" % x for x in ri))
+        print("  O_RI advancing:", len(set(ri)) > 1)
+    elif mode == "encrypt3":
+        # authoritative sequence: RDB key load -> ENABLE_KU -> I_AUTH_REQUEST
+        ST_CORE_AUTH = 1 << 3
+        CFG_RDB_KEY_LOAD = 1 << 10
+        SCHED, ENC_ONLY_WHEN_AUTH = 0xC0, 1 << 6
+        base = core.rd(CP_CONFIG) & 0x3FF   # keep current I_KEY_BASE_ADDRESS (0x80)
+        snap(core, "before")
+        # arm encrypt gate
+        core.wr(SCHED, core.rd(SCHED) | ENC_ONLY_WHEN_AUTH)
+        # fake sink BKSV (transmitter sums its keys at BKSV bit positions)
+        core.wr(BKSV0, BKSV & 0xFFFFFFFF); core.wr(BKSV1, (BKSV >> 32) & 0xFF)
+        # RDB software key load into the cipher key RAM at I_KEY_BASE_ADDRESS
+        cfg = core.rd(CP_CONFIG)
+        core.wr(CP_CONFIG, (cfg & ~0x3FF) | base | CFG_RDB_KEY_LOAD)
+        for n in range(40):
+            k = KEYS[n]
+            core.wr(HDCP_KEY_2, (k >> 24) & 0xFFFFFFFF)
+            core.wr(HDCP_KEY_1, ((k & 0xFFFFFF) << 8) | n)
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG) & ~CFG_RDB_KEY_LOAD)
+        # arm Ku (block-cipher key) computation
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG) | CFG_ENABLE_KU)
+        snap(core, "keys loaded + KU armed")
+        # THE trigger: real authentication -> runs block cipher
+        core.wr(HDCP_CTL, CTL_AUTH_REQ)
+        # poll for CORE_AUTHENTICATED
+        for i in range(40):
+            st = core.rd(CP_STATUS)
+            if st & ST_CORE_AUTH:
+                break
+            time.sleep(0.025)
+        snap(core, "after AUTH_REQUEST (polled %d)" % i)
+        an = (core.rd(AN1) << 32) | core.rd(AN0)
+        # watch O_RI[31:16] for advancement = cipher really running
+        ri0 = core.rd(CP_INTEGRITY)
+        time.sleep(0.5)
+        ri1 = core.rd(CP_INTEGRITY)
+        print("  An=0x%016x  Km(computed)=0x%014x" % (an, km))
+        print("  CP_INTEGRITY: 0x%08x -> 0x%08x  (O_RI %s)"
+              % (ri0, ri1, "ADVANCING" if ri0 != ri1 else "static"))
     elif mode == "encrypt2":
         CP_INTEGRITY_CFG = 0x50
         ALWAYS_REKEY = 1 << 16
