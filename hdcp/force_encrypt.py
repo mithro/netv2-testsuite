@@ -93,6 +93,32 @@ def main():
         core.wr(HDCP_CTL, 0)
         core.wr(CP_CONFIG, core.rd(CP_CONFIG) & ~CFG_ENABLE_KU)
         snap(core, "reverted")
+    elif mode == "encrypt5":
+        ST_AN_READY=1; ST_CORE_AUTH=1<<3; CFG_RDB_KEY_LOAD=1<<10
+        SCHED,ENC=0xC0,1<<6
+        snap(core,"before")
+        core.wr(SCHED, core.rd(SCHED)|ENC)
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG)&~0x3FF)      # base=0
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG)|CFG_RDB_KEY_LOAD)
+        for n in range(40):
+            k=KEYS[n]; core.wr(HDCP_KEY_2,(k>>24)&0xFFFFFFFF); core.wr(HDCP_KEY_1,((k&0xFFFFFF)<<8)|n)
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG)&~CFG_RDB_KEY_LOAD)
+        core.wr(CP_CONFIG, core.rd(CP_CONFIG)|CFG_ENABLE_KU)
+        # AUTH_REQUEST FIRST, then inject Bksv when engine wants it
+        core.wr(HDCP_CTL, CTL_AUTH_REQ)
+        for _ in range(20):
+            if core.rd(CP_STATUS)&ST_AN_READY: break
+            time.sleep(0.01)
+        snap(core,"AN generated; now inject BKSV")
+        core.wr(BKSV0, BKSV&0xFFFFFFFF); core.wr(BKSV1,(BKSV>>32)&0xFF)
+        got=-1
+        for i in range(80):
+            if core.rd(CP_STATUS)&ST_CORE_AUTH: got=i; break
+            time.sleep(0.025)
+        snap(core,"after BKSV inject (core_auth@%d)"%got)
+        ri=[core.rd(CP_INTEGRITY)]
+        for _ in range(3): time.sleep(0.5); ri.append(core.rd(CP_INTEGRITY))
+        print("  O_RI:", " ".join("0x%08x"%x for x in ri), "advancing=", len(set(ri))>1)
     elif mode == "encrypt4":
         ST_CORE_AUTH = 1 << 3
         CFG_RDB_KEY_LOAD = 1 << 10
