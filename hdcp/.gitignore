@@ -1,1 +1,5 @@
 keys/
+
+# HDCP device key material — never commit
+*.bin
+keys/

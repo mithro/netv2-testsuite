@@ -1,0 +1,9 @@
+{
+  "_comment": "KSVs for the closed-loop NeTV2<->RPi HDCP test rig. KSVs are exchanged in the clear over the HDMI DDC and are safe to commit. The device key sets (source_keys.bin, sink_keys.bin) and the agreed shared secret Km are NOT stored here and must never be committed; they live only in ~/netv2-hdcp-handoff/keys/ on the lab machines. Keys come from one symmetric master matrix (hdcp/keygen.py); no real DCP device keys or master key are used.",
+  "ksv_source": "0x108df2b8de",
+  "ksv_sink": "0x59cabe3384",
+  "ksv_source_ones": 20,
+  "ksv_sink_ones": 20,
+  "source": "RPi vc4 HDCP transmitter (Aksv = ksv_source)",
+  "sink": "NeTV2 HDCP receiver on hdmi_in0 (Bksv = ksv_sink)"
+}
