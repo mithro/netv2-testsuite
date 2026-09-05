@@ -1,0 +1,28 @@
+diff --git a/drivers/gpu/drm/vc4/vc4_hdmi.c b/drivers/gpu/drm/vc4/vc4_hdmi.c
+index 074afab..41fc06b 100644
+--- a/drivers/gpu/drm/vc4/vc4_hdmi.c
++++ b/drivers/gpu/drm/vc4/vc4_hdmi.c
+@@ -469,6 +469,11 @@ static int vc4_hdmi_connector_atomic_check(struct drm_connector *connector,
+ 	struct drm_connector_state *new_state =
+ 		drm_atomic_get_new_connector_state(state, connector);
+ 	struct drm_crtc *crtc = new_state->crtc;
++	int cp_ret;
++
++	cp_ret = vc4_hdcp_atomic_check(connector, old_state, new_state);
++	if (cp_ret)
++		return cp_ret;
+ 
+ 	if (!crtc)
+ 		return 0;
+@@ -601,6 +606,11 @@ static int vc4_hdmi_connector_init(struct drm_device *dev,
+ 
+ 	drm_connector_attach_encoder(connector, encoder);
+ 
++	ret = vc4_hdcp_connector_init(vc4_hdmi, connector);
++	if (ret)
++		drm_warn(dev, "vc4_hdcp: init failed (%d); HDCP output unavailable\n",
++			 ret);
++
+ 	return 0;
+ }
+ 

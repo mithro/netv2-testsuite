@@ -1,0 +1,31 @@
+diff --git a/drivers/gpu/drm/vc4/vc4_hdmi.h b/drivers/gpu/drm/vc4/vc4_hdmi.h
+index 4ab7c13..9217caf 100644
+--- a/drivers/gpu/drm/vc4/vc4_hdmi.h
++++ b/drivers/gpu/drm/vc4/vc4_hdmi.h
+@@ -141,6 +141,13 @@ struct vc4_hdmi {
+ 	/* VC5 Only */
+ 	void __iomem *rm_regs;
+ 
++	/* HDCP (see vc4_hdcp.c) */
++	void __iomem *hdcp_core;
++	void __iomem *hdcp_keyl;
++	u64 hdcp_keys[40];
++	bool hdcp_keys_valid;
++	struct delayed_work hdcp_check_work;
++
+ 	struct gpio_desc *hpd_gpio;
+ 
+ 	/*
+@@ -243,4 +250,12 @@ void vc6_hdmi_phy_init(struct vc4_hdmi *vc4_hdmi,
+ 		       struct drm_connector_state *conn_state);
+ void vc6_hdmi_phy_disable(struct vc4_hdmi *vc4_hdmi);
+ 
++int vc4_hdcp_connector_init(struct vc4_hdmi *hdmi, struct drm_connector *connector);
++int vc4_hdcp_atomic_check(struct drm_connector *connector,
++			  struct drm_connector_state *old_state,
++			  struct drm_connector_state *new_state);
++void vc4_hdcp_atomic_enable(struct vc4_hdmi *hdmi, u64 sink_bksv);
++int vc4_hdcp_enable(struct vc4_hdmi *hdmi, u64 bksv);
++void vc4_hdcp_disable(struct vc4_hdmi *hdmi);
++
+ #endif /* _VC4_HDMI_H_ */

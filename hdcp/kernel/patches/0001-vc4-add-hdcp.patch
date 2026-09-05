@@ -1,0 +1,269 @@
+diff --git a/drivers/gpu/drm/vc4/vc4_hdcp.c b/drivers/gpu/drm/vc4/vc4_hdcp.c
+new file mode 100644
+index 0000000..d1bd7ec
+--- /dev/null
++++ b/drivers/gpu/drm/vc4/vc4_hdcp.c
+@@ -0,0 +1,263 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * vc4_hdcp.c - HDCP 1.x transmitter support for the VideoCore-IV HDMI block
++ *              (BCM2835 / Raspberry Pi Zero/1). Exposes the DRM "Content
++ *              Protection" connector property and drives the Broadcom HDCP
++ *              cipher/auth engine + key-RAM loader.
++ *
++ * Derived from the verified out-of-tree bring-up module; register semantics
++ * cross-checked against Broadcom RDB headers and the GPL STB bchp_hdmi.h.
++ *
++ * Two register blocks are used:
++ *   - key-RAM loader   @ VC 0x7e809000 (own ioremap; not in the vc4 DT reg list)
++ *   - cipher/auth core @ VC 0x7e902000 (the HDMI core; HDCP regs at +0x10..+0x58)
++ *
++ * Device keys are supplied out-of-band (request_firmware "vc4_hdcp_keys.bin":
++ * 40 little-endian 7-byte device keys = 280 bytes). Producing HDCP output is an
++ * interoperability/bring-up capability; keys are the integrator's responsibility.
++ *
++ * Reaching CORE_AUTHENTICATED (real pixel encryption) requires a responding
++ * downstream HDCP sink for the DDC handshake; without one the engine stalls at
++ * O_AN_READY by design.
++ */
++#include <linux/io.h>
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/workqueue.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_print.h>
++#include <drm/display/drm_hdcp_helper.h>
++#include <drm/drm_managed.h>
++
++#include "vc4_hdmi.h"
++
++#define VC4_HDCP_KEYLOADER_PHYS  0x7e809000u  /* bus addr; probe maps ARM-phys */
++#define VC4_HDCP_BLK_LEN         0x1000u
++
++/* key-loader block */
++#define K_CTL   0x00
++#define K_ADR   0x04
++#define K_KY0   0x08
++#define K_KY1   0x0c
++#define K_START BIT(0)
++#define K_DONE  BIT(1)
++
++/* HDMI core HDCP registers (offsets into the HDMI core region) */
++#define R_BKSV0        0x10
++#define R_BKSV1        0x14
++#define R_AN0          0x18
++#define R_AN1          0x1c
++#define R_HDCP_KEY_1   0x3c
++#define R_HDCP_KEY_2   0x40
++#define R_HDCP_CTL     0x44
++#define R_CP_STATUS    0x48
++#define R_CP_INTEGRITY 0x4c
++#define R_CP_CONFIG    0x54
++#define R_CP_TST       0x58
++#define R_SCHED_CTL    0xc0
++
++#define CTL_AUTH_REQUEST BIT(0)
++#define CTL_CLR_RDB_AUTH BIT(1)
++#define CTL_FORCE_UNAUTH BIT(3)
++#define ST_AN_READY      BIT(0)
++#define ST_BKSV_VALID    BIT(1)
++#define ST_CORE_AUTH     BIT(3)
++#define ST_AUTH_OK       BIT(4)
++#define CFG_RDB_KEY_LOAD BIT(10)
++#define CFG_ENABLE_KU    BIT(19)
++#define CFG_KEY_BASE_MSK 0x3ff
++#define SCH_ENC_WHEN_AUTH BIT(6)
++
++#define VC4_HDCP_NKEYS   40
++#define VC4_HDCP_KEYLEN  7   /* bytes per 56-bit device key */
++
++/* HDCP receiver DDC read of Bksv would go here in a sink-present setup;
++ * for a controlled/bench setup an integrator may pin a balanced test KSV. */
++
++static inline u32 core_rd(struct vc4_hdmi *hdmi, u32 off)
++{
++	return readl(hdmi->hdcp_core + off);
++}
++static inline void core_wr(struct vc4_hdmi *hdmi, u32 off, u32 v)
++{
++	writel(v, hdmi->hdcp_core + off);
++}
++
++static u64 vc4_hdcp_km(struct vc4_hdmi *hdmi, u64 bksv)
++{
++	u64 km = 0;
++	int i;
++
++	for (i = 0; i < VC4_HDCP_NKEYS; i++)
++		if (bksv & (1ULL << i))
++			km = (km + hdmi->hdcp_keys[i]) & 0x00FFFFFFFFFFFFFFULL;
++	return km;
++}
++
++static void vc4_hdcp_load_keys(struct vc4_hdmi *hdmi)
++{
++	u32 cfg = core_rd(hdmi, R_CP_CONFIG) & ~CFG_KEY_BASE_MSK;
++	int n;
++
++	core_wr(hdmi, R_CP_CONFIG, cfg | CFG_RDB_KEY_LOAD);
++	for (n = 0; n < VC4_HDCP_NKEYS; n++) {
++		u64 k = hdmi->hdcp_keys[n];
++
++		core_wr(hdmi, R_HDCP_KEY_2, (u32)((k >> 24) & 0xffffffff));
++		core_wr(hdmi, R_HDCP_KEY_1, (u32)(((k & 0xffffff) << 8) | n));
++	}
++	core_wr(hdmi, R_CP_CONFIG, core_rd(hdmi, R_CP_CONFIG) & ~CFG_RDB_KEY_LOAD);
++}
++
++/* Attempt authentication + start encryption. bksv is the downstream sink KSV
++ * (read over DDC in a real setup). Returns 0 if CORE_AUTHENTICATED. */
++int vc4_hdcp_enable(struct vc4_hdmi *hdmi, u64 bksv)
++{
++	u32 st;
++	int i;
++
++	if (!hdmi->hdcp_core || !hdmi->hdcp_keyl || !hdmi->hdcp_keys_valid)
++		return -ENODEV;
++
++	core_wr(hdmi, R_SCHED_CTL, core_rd(hdmi, R_SCHED_CTL) | SCH_ENC_WHEN_AUTH);
++	core_wr(hdmi, R_BKSV0, (u32)(bksv & 0xffffffff));
++	core_wr(hdmi, R_BKSV1, (u32)((bksv >> 32) & 0xff));
++	vc4_hdcp_load_keys(hdmi);
++	core_wr(hdmi, R_CP_CONFIG, core_rd(hdmi, R_CP_CONFIG) | CFG_ENABLE_KU);
++	core_wr(hdmi, R_HDCP_CTL, CTL_AUTH_REQUEST);
++
++	for (i = 0; i < 100; i++) {
++		st = core_rd(hdmi, R_CP_STATUS);
++		if (st & ST_CORE_AUTH)
++			break;
++		usleep_range(1000, 2000);
++	}
++	st = core_rd(hdmi, R_CP_STATUS);
++	drm_dbg_kms(hdmi->connector.dev,
++		    "vc4_hdcp: CP_STATUS=0x%08x An=0x%08x%08x Km=0x%014llx\n",
++		    st, core_rd(hdmi, R_AN1), core_rd(hdmi, R_AN0),
++		    vc4_hdcp_km(hdmi, bksv));
++	if (!(st & ST_CORE_AUTH)) {
++		drm_warn(hdmi->connector.dev,
++			 "vc4_hdcp: authentication stalled (no responding HDCP sink?)\n");
++		return -EIO;
++	}
++	return 0;
++}
++
++void vc4_hdcp_disable(struct vc4_hdmi *hdmi)
++{
++	if (!hdmi->hdcp_core)
++		return;
++	core_wr(hdmi, R_SCHED_CTL, core_rd(hdmi, R_SCHED_CTL) & ~SCH_ENC_WHEN_AUTH);
++	core_wr(hdmi, R_CP_TST, 0);
++	core_wr(hdmi, R_HDCP_CTL, CTL_FORCE_UNAUTH | CTL_CLR_RDB_AUTH);
++	core_wr(hdmi, R_HDCP_CTL, 0);
++	core_wr(hdmi, R_CP_CONFIG, core_rd(hdmi, R_CP_CONFIG) & ~CFG_ENABLE_KU);
++}
++
++/* ~2s link-integrity watchdog: re-check Ri; on failure drop to DESIRED + retry */
++static void vc4_hdcp_check_work(struct work_struct *work)
++{
++	struct vc4_hdmi *hdmi = container_of(to_delayed_work(work),
++					     struct vc4_hdmi, hdcp_check_work);
++	u32 st = core_rd(hdmi, R_CP_STATUS);
++
++	if (!(st & ST_CORE_AUTH)) {
++		drm_connector_update_content_protection(
++			&hdmi->connector, DRM_MODE_CONTENT_PROTECTION_DESIRED);
++		return;
++	}
++	schedule_delayed_work(&hdmi->hdcp_check_work,
++			      msecs_to_jiffies(DRM_HDCP_CHECK_PERIOD_MS));
++}
++
++static int vc4_hdcp_load_keyfile(struct vc4_hdmi *hdmi)
++{
++	const struct firmware *fw;
++	int i, ret;
++
++	ret = request_firmware(&fw, "vc4_hdcp_keys.bin", &hdmi->pdev->dev);
++	if (ret)
++		return ret;
++	if (fw->size < VC4_HDCP_NKEYS * VC4_HDCP_KEYLEN) {
++		release_firmware(fw);
++		return -EINVAL;
++	}
++	for (i = 0; i < VC4_HDCP_NKEYS; i++) {
++		const u8 *p = fw->data + i * VC4_HDCP_KEYLEN;
++		u64 k = 0;
++		int b;
++
++		for (b = 0; b < VC4_HDCP_KEYLEN; b++)
++			k |= (u64)p[b] << (8 * b);
++		hdmi->hdcp_keys[i] = k;
++	}
++	hdmi->hdcp_keys_valid = true;
++	release_firmware(fw);
++	return 0;
++}
++
++/* Called from vc4_hdmi connector atomic_check when the CP property changes. */
++int vc4_hdcp_atomic_check(struct drm_connector *connector,
++			  struct drm_connector_state *old_state,
++			  struct drm_connector_state *new_state)
++{
++	u64 old_cp = old_state->content_protection;
++	u64 new_cp = new_state->content_protection;
++
++	if (old_cp == new_cp)
++		return 0;
++	/* userspace may only request UNDESIRED<->DESIRED */
++	if (new_cp == DRM_MODE_CONTENT_PROTECTION_ENABLED)
++		new_state->content_protection = DRM_MODE_CONTENT_PROTECTION_DESIRED;
++	return 0;
++}
++
++/* Called after a modeset when CP is DESIRED, to run authentication. */
++void vc4_hdcp_atomic_enable(struct vc4_hdmi *hdmi, u64 sink_bksv)
++{
++	struct drm_connector_state *cs = hdmi->connector.state;
++
++	if (!cs || cs->content_protection == DRM_MODE_CONTENT_PROTECTION_UNDESIRED)
++		return;
++	if (vc4_hdcp_enable(hdmi, sink_bksv) == 0) {
++		drm_connector_update_content_protection(
++			&hdmi->connector, DRM_MODE_CONTENT_PROTECTION_ENABLED);
++		schedule_delayed_work(&hdmi->hdcp_check_work,
++				      msecs_to_jiffies(DRM_HDCP_CHECK_PERIOD_MS));
++	}
++}
++
++static void vc4_hdcp_cancel_work(void *data)
++{
++	struct vc4_hdmi *hdmi = data;
++
++	cancel_delayed_work_sync(&hdmi->hdcp_check_work);
++}
++
++int vc4_hdcp_connector_init(struct vc4_hdmi *hdmi, struct drm_connector *connector)
++{
++	int ret;
++
++	hdmi->hdcp_keyl = devm_ioremap(&hdmi->pdev->dev,
++				       VC4_HDCP_KEYLOADER_PHYS, VC4_HDCP_BLK_LEN);
++	if (!hdmi->hdcp_keyl)
++		return -ENOMEM;
++	/* HDCP cipher regs live in the already-mapped HDMI core region */
++	hdmi->hdcp_core = hdmi->hdmicore_regs;
++
++	INIT_DELAYED_WORK(&hdmi->hdcp_check_work, vc4_hdcp_check_work);
++	ret = drmm_add_action_or_reset(connector->dev, vc4_hdcp_cancel_work, hdmi);
++	if (ret)
++		return ret;
++
++	ret = drm_connector_attach_content_protection_property(connector, false);
++	if (ret)
++		return ret;
++	/* optional: preload device keys from firmware (non-fatal if absent) */
++	if (vc4_hdcp_load_keyfile(hdmi))
++		drm_info(connector->dev,
++			 "vc4_hdcp: no vc4_hdcp_keys.bin; HDCP output disabled until keys provided\n");
++	return 0;
++}
